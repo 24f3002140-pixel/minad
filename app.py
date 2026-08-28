@@ -5,25 +5,26 @@ import re
 
 app = FastAPI()
 
-SAFE_MAX = 9007199254740991
-INTERVENTIONS = ["prompt_only", "retrieval", "lora", "qlora"]
-ADAPTER_FILES = ["adapter_config.json", "adapter_model.safetensors"]
+MAX_SAFE = 9007199254740991
 
-FULL_MODEL_FILES = {
-    "pytorch_model.bin",
-    "pytorch_model.bin.index.json",
-    "model.safetensors",
-    "model.safetensors.index.json",
-    "model.bin",
-    "model.bin.index.json",
-}
+INTERVENTIONS = [
+    "prompt_only",
+    "retrieval",
+    "lora",
+    "qlora",
+]
+
+ADAPTER_FILES = [
+    "adapter_config.json",
+    "adapter_model.safetensors",
+]
 
 
 def safe_int(x):
     return (
         isinstance(x, int)
         and not isinstance(x, bool)
-        and 0 <= x <= SAFE_MAX
+        and 0 <= x <= MAX_SAFE
     )
 
 
@@ -31,7 +32,7 @@ def positive_safe_int(x):
     return (
         isinstance(x, int)
         and not isinstance(x, bool)
-        and 0 < x <= SAFE_MAX
+        and 0 < x <= MAX_SAFE
     )
 
 
@@ -43,12 +44,12 @@ def finite_number(x):
     )
 
 
-def utf8_sort(values):
-    return sorted(values, key=lambda x: x.encode("utf-8"))
+def utf8_sort(items):
+    return sorted(items, key=lambda x: x.encode("utf-8"))
 
 
-def sort_codes(values):
-    return utf8_sort(list(set(values)))
+def unique_sorted_codes(items):
+    return utf8_sort(list(set(items)))
 
 
 # ============================================================
@@ -56,17 +57,26 @@ def sort_codes(values):
 # ============================================================
 
 def choose(data):
-    names = INTERVENTIONS
+
+    policy = data.get("policy")
+    candidates = data.get("candidates")
 
     result = {
         "selected": None,
         "eligible": [],
-        "totalCosts": {n: None for n in names},
-        "reasonCodes": {n: ["INVALID_INPUT"] for n in names},
+        "totalCosts": {
+            "prompt_only": None,
+            "retrieval": None,
+            "lora": None,
+            "qlora": None,
+        },
+        "reasonCodes": {
+            "prompt_only": ["INVALID_INPUT"],
+            "retrieval": ["INVALID_INPUT"],
+            "lora": ["INVALID_INPUT"],
+            "qlora": ["INVALID_INPUT"],
+        },
     }
-
-    policy = data.get("policy")
-    candidates = data.get("candidates")
 
     policy_valid = (
         isinstance(policy, dict)
@@ -84,17 +94,23 @@ def choose(data):
     )
 
     candidate_map = {}
-    candidates_valid = isinstance(candidates, list) and len(candidates) == 4
+
+    candidates_valid = (
+        isinstance(candidates, list)
+        and len(candidates) == 4
+    )
 
     if candidates_valid:
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
+
+        for c in candidates:
+
+            if not isinstance(c, dict):
                 candidates_valid = False
                 continue
 
-            name = candidate.get("name")
+            name = c.get("name")
 
-            if name not in names:
+            if name not in INTERVENTIONS:
                 candidates_valid = False
                 continue
 
@@ -102,18 +118,19 @@ def choose(data):
                 candidates_valid = False
                 continue
 
-            candidate_map[name] = candidate
+            candidate_map[name] = c
 
-    if set(candidate_map.keys()) != set(names):
+    if set(candidate_map.keys()) != set(INTERVENTIONS):
         candidates_valid = False
 
     if not policy_valid or not candidates_valid:
         return result
 
-    for name in names:
+    for name in INTERVENTIONS:
+
         c = candidate_map[name]
 
-        required = [
+        fields = [
             "available",
             "quality",
             "freshness",
@@ -124,43 +141,46 @@ def choose(data):
             "recurringCost",
         ]
 
-        valid = all(k in c for k in required)
+        valid = all(field in c for field in fields)
 
-        valid = valid and isinstance(c.get("available"), bool)
+        if valid:
+            valid = isinstance(c["available"], bool)
 
-        valid = (
-            valid
-            and finite_number(c.get("quality"))
-            and 0 <= c["quality"] <= 1
-        )
+        if valid:
+            valid = (
+                finite_number(c["quality"])
+                and 0 <= c["quality"] <= 1
+            )
 
-        valid = valid and isinstance(c.get("freshness"), bool)
+        if valid:
+            valid = isinstance(c["freshness"], bool)
 
-        valid = (
-            valid
-            and finite_number(c.get("latencyMs"))
-            and c["latencyMs"] >= 0
-        )
+        if valid:
+            valid = (
+                finite_number(c["latencyMs"])
+                and c["latencyMs"] >= 0
+            )
 
-        valid = (
-            valid
-            and finite_number(c.get("memoryMb"))
-            and c["memoryMb"] >= 0
-        )
+        if valid:
+            valid = (
+                finite_number(c["memoryMb"])
+                and c["memoryMb"] >= 0
+            )
 
-        valid = valid and safe_int(c.get("labeledExamples"))
+        if valid:
+            valid = safe_int(c["labeledExamples"])
 
-        valid = (
-            valid
-            and finite_number(c.get("oneTimeCost"))
-            and c["oneTimeCost"] >= 0
-        )
+        if valid:
+            valid = (
+                finite_number(c["oneTimeCost"])
+                and c["oneTimeCost"] >= 0
+            )
 
-        valid = (
-            valid
-            and finite_number(c.get("recurringCost"))
-            and c["recurringCost"] >= 0
-        )
+        if valid:
+            valid = (
+                finite_number(c["recurringCost"])
+                and c["recurringCost"] >= 0
+            )
 
         if not valid:
             result["reasonCodes"][name] = ["INVALID_INPUT"]
@@ -171,9 +191,7 @@ def choose(data):
             + policy["horizonRequests"] * c["recurringCost"]
         )
 
-        total = round(total, 12)
-
-        result["totalCosts"][name] = total
+        result["totalCosts"][name] = round(total, 12)
 
         reasons = []
 
@@ -183,7 +201,10 @@ def choose(data):
         if c["quality"] < policy["minQuality"]:
             reasons.append("QUALITY_FLOOR")
 
-        if policy["freshnessRequired"] and not c["freshness"]:
+        if (
+            policy["freshnessRequired"]
+            and not c["freshness"]
+        ):
             reasons.append("FRESHNESS_REQUIRED")
 
         if c["latencyMs"] > policy["maxLatencyMs"]:
@@ -192,13 +213,21 @@ def choose(data):
         if c["memoryMb"] > policy["maxMemoryMb"]:
             reasons.append("MEMORY_LIMIT")
 
-        if c["labeledExamples"] > policy["maxLabeledExamples"]:
+        if (
+            c["labeledExamples"]
+            > policy["maxLabeledExamples"]
+        ):
             reasons.append("DATA_LIMIT")
 
-        if total > policy["maxTotalCost"]:
+        if (
+            result["totalCosts"][name]
+            > policy["maxTotalCost"]
+        ):
             reasons.append("COST_LIMIT")
 
-        result["reasonCodes"][name] = sort_codes(reasons)
+        result["reasonCodes"][name] = unique_sorted_codes(
+            reasons
+        )
 
         if not reasons:
             result["eligible"].append(name)
@@ -210,34 +239,11 @@ def choose(data):
 
 
 # ============================================================
-# PEFT PARAMETER VALIDATION
+# REPAIR
 # ============================================================
 
-def valid_parameter_shape(parameter):
-    if "shape" not in parameter:
-        return True
-
-    shape = parameter["shape"]
-    numel = parameter.get("numel")
-
-    if not isinstance(shape, list) or len(shape) == 0:
-        return False
-
-    product = 1
-
-    for dimension in shape:
-        if not positive_safe_int(dimension):
-            return False
-
-        if product > SAFE_MAX // dimension:
-            return False
-
-        product *= dimension
-
-    return product == numel
-
-
 def repair(data):
+
     reasons = []
 
     # --------------------------------------------------------
@@ -252,7 +258,9 @@ def repair(data):
     )
 
     if token_valid:
+
         for token in tokens:
+
             if not isinstance(token, dict):
                 token_valid = False
                 break
@@ -269,35 +277,51 @@ def repair(data):
                 token_valid = False
                 break
 
-            if not isinstance(token.get("padding"), bool):
+            if not isinstance(
+                token.get("padding"),
+                bool,
+            ):
                 token_valid = False
                 break
 
-            if not isinstance(token.get("text"), str):
+            if not isinstance(
+                token.get("text"),
+                str,
+            ):
                 token_valid = False
                 break
 
     if token_valid:
-        labels = [
-            token["id"]
-            if token["role"] == "assistant"
-            and token["padding"] is False
-            else -100
-            for token in tokens
-        ]
+
+        labels = []
+
+        for token in tokens:
+
+            if (
+                token["role"] == "assistant"
+                and token["padding"] is False
+            ):
+                labels.append(token["id"])
+            else:
+                labels.append(-100)
+
     else:
+
         labels = (
             [-100] * len(tokens)
             if isinstance(tokens, list)
             else []
         )
+
         reasons.append("INVALID_TOKEN")
 
     # --------------------------------------------------------
-    # CHAT TEMPLATE
+    # TEMPLATE
     # --------------------------------------------------------
 
-    template_pass = data.get("templateApplications") == 1
+    template_pass = (
+        data.get("templateApplications") == 1
+    )
 
     if not template_pass:
         reasons.append("CHAT_TEMPLATE_COUNT")
@@ -309,85 +333,91 @@ def repair(data):
     parameters = data.get("parameters")
     allowed_targets = data.get("allowedTargets")
 
-    parameter_pass = True
+    parameter_valid = True
 
     if not isinstance(parameters, list):
+        parameter_valid = False
         parameters = []
-        parameter_pass = False
 
-    if not isinstance(allowed_targets, list):
-        allowed_targets = []
-        parameter_pass = False
-
-    if len(allowed_targets) == 0:
-        parameter_pass = False
-
-    if len(allowed_targets) != len(set(allowed_targets)):
-        parameter_pass = False
-
-    if any(
-        not isinstance(target, str) or target == ""
-        for target in allowed_targets
+    if (
+        not isinstance(allowed_targets, list)
+        or len(allowed_targets) == 0
     ):
-        parameter_pass = False
+        parameter_valid = False
+        allowed_targets = []
+
+    else:
+
+        if len(allowed_targets) != len(
+            set(allowed_targets)
+        ):
+            parameter_valid = False
+
+        if any(
+            not isinstance(x, str)
+            for x in allowed_targets
+        ):
+            parameter_valid = False
 
     seen_names = set()
     trainable = []
 
     for parameter in parameters:
+
         if not isinstance(parameter, dict):
-            parameter_pass = False
+            parameter_valid = False
             continue
 
         name = parameter.get("name")
         target = parameter.get("target")
         numel = parameter.get("numel")
 
-        if not isinstance(name, str) or name == "":
-            parameter_pass = False
+        if not isinstance(name, str):
+            parameter_valid = False
             continue
 
-        if not isinstance(target, str) or target == "":
-            parameter_pass = False
+        if name == "":
+            parameter_valid = False
+            continue
+
+        if not isinstance(target, str):
+            parameter_valid = False
+            continue
+
+        if target == "":
+            parameter_valid = False
             continue
 
         if not positive_safe_int(numel):
-            parameter_pass = False
+            parameter_valid = False
             continue
 
         if name in seen_names:
-            parameter_pass = False
+            parameter_valid = False
             continue
-
-        if not valid_parameter_shape(parameter):
-            parameter_pass = False
 
         seen_names.add(name)
 
-        is_lora_parameter = (
+        is_lora = (
             name.endswith(".lora_A.weight")
             or name.endswith(".lora_B.weight")
         )
 
-        if target in allowed_targets and is_lora_parameter:
+        if (
+            target in allowed_targets
+            and is_lora
+        ):
             trainable.append(parameter)
 
-    if not any(
-        isinstance(p, dict)
-        and isinstance(p.get("name"), str)
-        and isinstance(p.get("target"), str)
-        and p.get("target") in allowed_targets
-        and (
-            p["name"].endswith(".lora_A.weight")
-            or p["name"].endswith(".lora_B.weight")
-        )
-        for p in parameters
-    ):
-        parameter_pass = False
+    # At least one valid LoRA parameter must
+    # use an allowed target.
+    if len(trainable) == 0:
+        parameter_valid = False
 
-    if not parameter_pass:
+    if not parameter_valid:
         reasons.append("INVALID_PARAMETER")
 
+    # UTF-8 byte sorting
     trainable.sort(
         key=lambda p: p["name"].encode("utf-8")
     )
@@ -397,19 +427,26 @@ def repair(data):
         for p in trainable
     ]
 
+    # Safe sum
     trainable_count = 0
 
     for p in trainable:
-        if trainable_count > SAFE_MAX - p["numel"]:
+
+        n = p["numel"]
+
+        if (
+            trainable_count
+            > MAX_SAFE - n
+        ):
+            parameter_valid = False
             trainable_count = 0
-            parameter_pass = False
 
             if "INVALID_PARAMETER" not in reasons:
                 reasons.append("INVALID_PARAMETER")
 
             break
 
-        trainable_count += p["numel"]
+        trainable_count += n
 
     # --------------------------------------------------------
     # INFERENCE
@@ -424,33 +461,67 @@ def repair(data):
 
     artifact_files = data.get("artifactFiles")
 
-    if (
-        isinstance(artifact_files, list)
-        and all(isinstance(x, str) for x in artifact_files)
-    ):
-        adapter_files = utf8_sort(artifact_files)
+    if isinstance(artifact_files, list):
 
-        full_model = any(
-            x in FULL_MODEL_FILES
-            for x in artifact_files
+        adapter_files = [
+            x for x in artifact_files
+            if isinstance(x, str)
+        ]
+
+        adapter_files = utf8_sort(
+            adapter_files
         )
+
     else:
+
         adapter_files = []
-        full_model = False
 
-    if full_model:
-        reasons.append("FULL_MODEL_ARTIFACT")
-
+    # Exact set, exactly once each.
     adapter_pass = (
         isinstance(artifact_files, list)
         and len(artifact_files) == 2
+        and all(
+            isinstance(x, str)
+            for x in artifact_files
+        )
         and len(set(artifact_files)) == 2
-        and all(isinstance(x, str) for x in artifact_files)
-        and utf8_sort(artifact_files) == ADAPTER_FILES
+        and utf8_sort(
+            artifact_files
+        ) == ADAPTER_FILES
     )
 
     if not adapter_pass:
         reasons.append("ADAPTER_FILE_SET")
+
+    # A full-model artifact is specifically
+    # a model artifact, rather than an adapter.
+    full_model_artifact = False
+
+    if isinstance(artifact_files, list):
+
+        for filename in artifact_files:
+
+            if not isinstance(filename, str):
+                continue
+
+            lower = filename.lower()
+
+            if (
+                lower.endswith(".bin")
+                or lower.endswith(".safetensors")
+                and lower not in {
+                    "adapter_model.safetensors"
+                }
+            ):
+                if (
+                    lower.startswith("pytorch_model")
+                    or lower.startswith("model.")
+                    or lower == "model.safetensors"
+                ):
+                    full_model_artifact = True
+
+    if full_model_artifact:
+        reasons.append("FULL_MODEL_ARTIFACT")
 
     # --------------------------------------------------------
     # CHECKPOINT
@@ -462,14 +533,14 @@ def repair(data):
         isinstance(checkpoint, dict)
         and all(
             key in checkpoint
-            for key in [
+            for key in (
                 "model",
                 "optimizer",
                 "scheduler",
                 "step",
                 "rng",
                 "dataPosition",
-            ]
+            )
         )
     )
 
@@ -480,9 +551,11 @@ def repair(data):
     # LINEAGE
     # --------------------------------------------------------
 
-    base_revision = data.get("baseRevision")
+    base_revision = data.get(
+        "baseRevision"
+    )
 
-    base_revision_valid = (
+    base_valid = (
         isinstance(base_revision, str)
         and re.fullmatch(
             r"[0-9a-f]{40}",
@@ -490,50 +563,70 @@ def repair(data):
         ) is not None
     )
 
-    if not base_revision_valid:
-        reasons.append("MUTABLE_BASE_REVISION")
+    if not base_valid:
+        reasons.append(
+            "MUTABLE_BASE_REVISION"
+        )
 
-    digest_valid = all(
-        isinstance(data.get(key), str)
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            data.get(key),
-        ) is not None
-        for key in [
-            "datasetDigest",
-            "codeDigest",
-            "configDigest",
-        ]
-    )
+    digest_valid = True
+
+    for key in (
+        "datasetDigest",
+        "codeDigest",
+        "configDigest",
+    ):
+
+        value = data.get(key)
+
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                value,
+            ) is None
+        ):
+            digest_valid = False
 
     lineage_pass = (
-        base_revision_valid
+        base_valid
         and digest_valid
     )
 
-    expected = data.get("expectedDigests")
+    expected = data.get(
+        "expectedDigests"
+    )
 
     if isinstance(expected, dict):
-        for key in [
+
+        for key in (
             "datasetDigest",
             "codeDigest",
             "configDigest",
-        ]:
+        ):
+
             if (
                 key in expected
-                and expected[key] != data.get(key)
+                and expected[key]
+                != data.get(key)
             ):
                 lineage_pass = False
 
     if not lineage_pass:
-        reasons.append("LINEAGE_MISMATCH")
+        reasons.append(
+            "LINEAGE_MISMATCH"
+        )
 
     # --------------------------------------------------------
-    # EVALUATION ISOLATION
+    # EVAL ISOLATION
     # --------------------------------------------------------
 
-    train_ids = data.get("trainRowIds")
-    eval_ids = data.get("evalRowIds")
+    train_ids = data.get(
+        "trainRowIds"
+    )
+
+    eval_ids = data.get(
+        "evalRowIds"
+    )
 
     eval_isolated = (
         isinstance(train_ids, list)
@@ -541,65 +634,87 @@ def repair(data):
         and len(train_ids) > 0
         and len(eval_ids) > 0
         and all(
-            isinstance(x, str) and x != ""
+            isinstance(x, str)
+            and x != ""
             for x in train_ids
         )
         and all(
-            isinstance(x, str) and x != ""
+            isinstance(x, str)
+            and x != ""
             for x in eval_ids
         )
-        and len(train_ids) == len(set(train_ids))
-        and len(eval_ids) == len(set(eval_ids))
-        and set(train_ids).isdisjoint(set(eval_ids))
+        and len(train_ids)
+        == len(set(train_ids))
+        and len(eval_ids)
+        == len(set(eval_ids))
+        and set(train_ids).isdisjoint(
+            set(eval_ids)
+        )
     )
 
     if not eval_isolated:
-        reasons.append("EVAL_LEAKAGE")
+        reasons.append(
+            "EVAL_LEAKAGE"
+        )
 
     # --------------------------------------------------------
-    # DROPOUT
+    # EVAL DROPOUT
     # --------------------------------------------------------
 
     evaluation_deterministic = (
-        data.get("dropoutActiveDuringEval") is False
+        data.get(
+            "dropoutActiveDuringEval"
+        ) is False
     )
 
     if not evaluation_deterministic:
-        reasons.append("EVAL_DROPOUT_ACTIVE")
+        reasons.append(
+            "EVAL_DROPOUT_ACTIVE"
+        )
 
     # --------------------------------------------------------
     # EFFECTIVE BATCH
     # --------------------------------------------------------
 
-    micro_batch = data.get("microBatch")
+    micro_batch = data.get(
+        "microBatch"
+    )
+
     gradient_accumulation = data.get(
         "gradientAccumulation"
     )
-    replicas = data.get("replicas")
-    expected_effective_batch = data.get(
+
+    replicas = data.get(
+        "replicas"
+    )
+
+    expected_batch = data.get(
         "expectedEffectiveBatch"
     )
 
     batch_valid = all(
         positive_safe_int(x)
-        for x in [
+        for x in (
             micro_batch,
             gradient_accumulation,
             replicas,
-            expected_effective_batch,
-        ]
+            expected_batch,
+        )
     )
 
     if batch_valid:
+
         batch_valid = (
             micro_batch
             * gradient_accumulation
             * replicas
-            == expected_effective_batch
+            == expected_batch
         )
 
     if not batch_valid:
-        reasons.append("EFFECTIVE_BATCH_MISMATCH")
+        reasons.append(
+            "EFFECTIVE_BATCH_MISMATCH"
+        )
 
     # --------------------------------------------------------
     # RESUME
@@ -608,14 +723,21 @@ def repair(data):
     uninterrupted = data.get(
         "uninterruptedWeights"
     )
-    resumed = data.get("resumedWeights")
-    tolerance = data.get("resumeTolerance")
+
+    resumed = data.get(
+        "resumedWeights"
+    )
+
+    tolerance = data.get(
+        "resumeTolerance"
+    )
 
     resume_pass = (
         isinstance(uninterrupted, list)
         and isinstance(resumed, list)
         and len(uninterrupted) > 0
-        and len(uninterrupted) == len(resumed)
+        and len(uninterrupted)
+        == len(resumed)
         and finite_number(tolerance)
         and tolerance >= 0
         and all(
@@ -636,10 +758,12 @@ def repair(data):
     )
 
     if not resume_pass:
-        reasons.append("RESUME_DIVERGENCE")
+        reasons.append(
+            "RESUME_DIVERGENCE"
+        )
 
     # --------------------------------------------------------
-    # EXACT RESPONSE
+    # REQUIRED EXACT RESPONSE
     # --------------------------------------------------------
 
     return {
@@ -647,14 +771,16 @@ def repair(data):
         "templatePass": template_pass,
         "trainableParams": trainable_params,
         "trainableCount": trainable_count,
-        "peftConfigPass": parameter_pass,
+        "peftConfigPass": parameter_valid,
         "adapterFiles": adapter_files,
         "checkpointComplete": checkpoint_complete,
         "lineagePass": lineage_pass,
         "evalIsolated": eval_isolated,
         "evaluationDeterministic": evaluation_deterministic,
         "resumePass": resume_pass,
-        "reasonCodes": sort_codes(reasons),
+        "reasonCodes": unique_sorted_codes(
+            reasons
+        ),
     }
 
 
@@ -664,22 +790,32 @@ def repair(data):
 
 @app.post("/adapt")
 async def adapt(request: Request):
+
     try:
         data = await request.json()
     except Exception:
+
         return JSONResponse(
             status_code=400,
-            content={"error": "INVALID_INPUT"},
+            content={
+                "error": "INVALID_INPUT"
+            },
         )
 
     if (
         not isinstance(data, dict)
         or data.get("operation")
-        not in ("choose", "repair")
+        not in (
+            "choose",
+            "repair",
+        )
     ):
+
         return JSONResponse(
             status_code=400,
-            content={"error": "INVALID_INPUT"},
+            content={
+                "error": "INVALID_INPUT"
+            },
         )
 
     if data["operation"] == "choose":
